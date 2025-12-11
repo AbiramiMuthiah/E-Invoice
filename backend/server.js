@@ -2,73 +2,94 @@ require('dotenv').config();
 
 const express = require('express');
 const multer = require('multer');
-const { ImageAnnotatorClient } = require('@google-cloud/vision');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 const cors = require('cors');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const upload = multer({ storage: multer.memoryStorage() });
+const axios = require('axios');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
-const upload = multer({ storage: multer.memoryStorage() });
 
-/* ============================================================
-   🔥 GOOGLE CLOUD VISION – VERCEL FIX
-   We load credentials from the Vercel env variable:
-   GOOGLE_APPLICATION_CREDENTIALS_JSON
-   ============================================================ */
+// ===============================
+// GOOGLE CREDENTIALS FOR VERCEL
+// ===============================
+const googleCreds = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON
+  ? JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON)
+  : null;
 
-let visionClient, genAI, model;
-
-try {
-  // --- Load Google Vision Credentials from ENV (Vercel compatible)
-  const googleCreds = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON
-    ? JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON)
-    : null;
-
-  if (!googleCreds) {
-    throw new Error("Google Vision credentials missing! Add GOOGLE_APPLICATION_CREDENTIALS_JSON in Vercel.");
-  }
-
-  visionClient = new ImageAnnotatorClient({
-    credentials: googleCreds,
-    projectId: googleCreds.project_id
-  });
-
-  // --- Gemini API
-  if (!process.env.GEMINI_API_KEY) {
-    throw new Error("GEMINI_API_KEY missing! Add it in Vercel.");
-  }
-
-  genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-  model = genAI.getGenerativeModel({ model: "gemini-1.5-pro-latest" });
-
-  console.log('✅ Google AI clients initialized successfully.');
-} catch (error) {
-  console.error('❌ FATAL ERROR:', error.message);
+if (!googleCreds) {
+  console.error("❌ Missing GOOGLE_APPLICATION_CREDENTIALS_JSON in Vercel!");
   process.exit(1);
 }
 
-/* ============================================================
-   PROMPT
-   ============================================================ */
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro-latest" });
 
+// ===============================
+// GOOGLE VISION USING REST API
+// ===============================
+async function extractTextWithVision(base64Image) {
+  const url = `https://vision.googleapis.com/v1/images:annotate?key=${googleCreds.private_key_id}`;
+
+  const body = {
+    requests: [
+      {
+        image: { content: base64Image },
+        features: [{ type: "TEXT_DETECTION" }]
+      }
+    ]
+  };
+
+  const response = await axios.post(url, body);
+  return response.data.responses[0].fullTextAnnotation?.text || "";
+}
+
+// ===============================
+// PROMPT
+// ===============================
 const INVOICE_GENERATION_PROMPT = `
-  Analyze the text and structure it as a JSON object for an invoice with keys: vendor, vendorAddress, client, clientAddress, invoiceNumber, date, dueDate, items, subtotal, tax, total. 'items' must be an array of objects with keys: description, quantity, unitPrice, total. Use "" for missing text and 0 for missing numbers. Text: """{EXTRACTED_TEXT}""" JSON Output:
+Analyze the text and structure it into an invoice JSON with keys:
+vendor, vendorAddress, client, clientAddress, invoiceNumber, date, dueDate, items, subtotal, tax, total.
+Items must be an array of objects: description, quantity, unitPrice, total.
+Empty fields = "" or 0.
+Text: """{EXTRACTED_TEXT}""" 
+JSON Output:
 `;
 
-/* ============================================================
-   ROUTES
-   ============================================================ */
-
+// ===============================
+// ROUTE
+// ===============================
 app.post('/api/process-image', upload.single('invoiceImage'), async (req, res) => {
-  // your existing code goes here (unchanged)
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    const base64Image = req.file.buffer.toString("base64");
+
+    // 1️⃣ Extract text from the image
+    const extractedText = await extractTextWithVision(base64Image);
+
+    // 2️⃣ Generate structured invoice JSON
+    const result = await model.generateContent(
+      INVOICE_GENERATION_PROMPT.replace("{EXTRACTED_TEXT}", extractedText)
+    );
+
+    const responseText = result.response.text();
+    res.json({ extractedText, invoice: JSON.parse(responseText) });
+
+  } catch (error) {
+    console.error("❌ Error:", error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
-/* ============================================================
-   START SERVER
-   ============================================================ */
-
+// ===============================
+// SERVER
+// ===============================
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () =>
-  console.log(`🚀 Server is running on http://localhost:${PORT}`)
+  console.log(`🚀 Server running on http://localhost:${PORT}`)
 );
+
